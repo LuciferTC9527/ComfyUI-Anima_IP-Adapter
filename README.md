@@ -7,7 +7,7 @@ IP-Adapter for [Anima](https://huggingface.co/circlestone-labs/Anima), supportin
 Clone into `ComfyUI/custom_nodes/`:
 ```bash
 cd ComfyUI/custom_nodes/
-git clone https://github.com/LuciferTC9527/ComfyUI-Anima-IP-Adapter.git
+git clone https://github.com/LuciferTC9527/ComfyUI-Anima_IP-Adapter.git
 ```
 
 ## Required Models
