@@ -623,7 +623,8 @@ class AnimaIPAdapterApply:
                         return result
 
                     x_q = _blk_ref._x_cross_flat
-                    ip_tok = ip_tok.to(dtype=result.dtype)
+                    ip_dtype = _blk_ref.ip_k_proj.weight.dtype
+                    ip_tok = ip_tok.to(dtype=ip_dtype)
                     B = x_B_T_H_W_D.shape[0]
                     T, H, W = x_B_T_H_W_D.shape[1], x_B_T_H_W_D.shape[2], x_B_T_H_W_D.shape[3]
                     n_h = _blk_ref.cross_attn.n_heads
@@ -720,7 +721,7 @@ class AnimaIPAdapterApply:
               f"norm={ip_tokens.norm().item():.4f}, strength={strength}")
 
         # Null tokens: gray-image encoding or checkpoint/zeros
-        ip_tokens_stored = ip_tokens.detach()
+        ip_tokens_stored = ip_tokens.detach().to(dtype=model_dtype)
         null_tokens_stored = ip_adapter.get("null_tokens", None)
         if gray_null:
             # Encode a gray image → natural "no signal" embedding in SigLIP2 space
@@ -773,11 +774,12 @@ class AnimaIPAdapterApply:
               ip_eff = ip_cfg_scale - 1.0
             """
 
-            def __init__(self, ip_tokens, null_tokens, ip_cfg_scale, ip_cfg_separate):
+            def __init__(self, ip_tokens, null_tokens, ip_cfg_scale, ip_cfg_separate, ip_dtype):
                 self.ip_tokens = ip_tokens
                 self.null_tokens = null_tokens
                 self.ip_cfg_scale = ip_cfg_scale
                 self.ip_cfg_separate = ip_cfg_separate
+                self.ip_dtype = ip_dtype
                 self._printed = False
                 self._cond_wo_ip = None      # prediction without IP (for post_cfg)
                 # When bound to text CFG, always enabled (old behavior).
@@ -796,16 +798,15 @@ class AnimaIPAdapterApply:
 
                 if not all_uncond:
                     ip_B = model_input.shape[0]
-                    target_dtype = model_input.dtype
                     target_device = model_input.device
 
-                    ip_tok = self.ip_tokens.to(dtype=target_dtype,
+                    ip_tok = self.ip_tokens.to(dtype=self.ip_dtype,
                                                 device=target_device)
                     ip_tok_batch = ip_tok.expand(ip_B, -1, -1).clone()
 
                     if self._enabled and cond_or_uncond is not None:
                         # cond → real, uncond → null (common to both modes)
-                        null_tok = self.null_tokens.to(dtype=target_dtype, device=target_device)
+                        null_tok = self.null_tokens.to(dtype=self.ip_dtype, device=target_device)
                         for idx, is_uncond in enumerate(cond_or_uncond):
                             if idx < ip_B and is_uncond:
                                 ip_tok_batch[idx] = null_tok
@@ -878,7 +879,7 @@ class AnimaIPAdapterApply:
             def to(self, *args, **kwargs):
                 return self
 
-        handler = IPAdapterHandler(ip_tokens_stored, null_tokens_stored, ip_cfg_scale, ip_cfg_separate)
+        handler = IPAdapterHandler(ip_tokens_stored, null_tokens_stored, ip_cfg_scale, ip_cfg_separate, model_dtype)
         patched_model.set_model_unet_function_wrapper(handler)
         patched_model.set_model_sampler_post_cfg_function(handler.post_cfg)
         return (patched_model,)
