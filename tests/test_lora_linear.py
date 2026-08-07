@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import comfy.memory_management
 
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
@@ -39,6 +40,27 @@ class LoRALinearTest(unittest.TestCase):
         expected = base(x) + (x @ lora_A.to(torch.float16).T @ lora_B.to(torch.float16).T) * 0.5
         self.assertEqual(output.dtype, torch.float16)
         torch.testing.assert_close(output, expected)
+
+    def test_injected_linear_casts_bfloat16_weights_to_fp16_activations(self):
+        layer = nodes._make_linear(4, 3, dtype=torch.bfloat16)
+        x = torch.randn(2, 4, dtype=torch.float16)
+
+        output = layer(x)
+
+        self.assertEqual(layer.weight.dtype, torch.bfloat16)
+        self.assertEqual(output.dtype, torch.float16)
+
+    def test_injected_linear_materializes_weights_with_aimdo_enabled(self):
+        aimdo_enabled = comfy.memory_management.aimdo_enabled
+        try:
+            comfy.memory_management.aimdo_enabled = True
+            layer = nodes._make_linear(4, 3, dtype=torch.bfloat16)
+        finally:
+            comfy.memory_management.aimdo_enabled = aimdo_enabled
+
+        self.assertIsNotNone(layer.weight)
+        self.assertIsNotNone(layer.bias)
+        self.assertEqual(layer.weight.shape, (3, 4))
 
 
 if __name__ == "__main__":
