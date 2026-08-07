@@ -71,7 +71,9 @@ class _LoRALinear(nn.Module):
         self.scale = scale
 
     def forward(self, x):
-        return self.base(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scale
+        lora_A = self.lora_A.to(device=x.device, dtype=x.dtype)
+        lora_B = self.lora_B.to(device=x.device, dtype=x.dtype)
+        return self.base(x) + (x @ lora_A.T @ lora_B.T) * self.scale
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
