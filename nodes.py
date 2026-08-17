@@ -17,6 +17,7 @@ import re
 import inspect
 import os
 import folder_paths
+import comfy.ops
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,14 +37,36 @@ SIGLIP_IMAGE_SIZE = 512
 # Shared projection helpers (for ip_shared_projection = true training)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _make_linear(in_features, out_features, bias=True, device=None, dtype=None):
+    """Linear layer that casts stored weights to the runtime activation dtype."""
+    layer = comfy.ops.manual_cast.Linear(
+        in_features, out_features, bias=bias, device=device, dtype=dtype)
+    factory_kwargs = {"device": device, "dtype": dtype}
+    if layer.weight is None:
+        layer.weight = nn.Parameter(
+            torch.empty((out_features, in_features), **factory_kwargs),
+            requires_grad=False,
+        )
+    if bias and layer.bias is None:
+        layer.bias = nn.Parameter(
+            torch.empty(out_features, **factory_kwargs),
+            requires_grad=False,
+        )
+    nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
+    if layer.bias is not None:
+        bound = 1 / math.sqrt(in_features) if in_features > 0 else 0
+        nn.init.uniform_(layer.bias, -bound, bound)
+    return layer
+
+
 def _make_shared_proj(dim, inner_dim, device, dtype):
     """Shared projection module: Linear → GELU → Linear."""
     class _Proj(nn.Module):
         def __init__(self):
             super().__init__()
-            self.expand = nn.Linear(dim, inner_dim)
+            self.expand = _make_linear(dim, inner_dim)
             self.act = nn.GELU()
-            self.project = nn.Linear(inner_dim, inner_dim)
+            self.project = _make_linear(inner_dim, inner_dim)
         def forward(self, x):
             x = self.expand(x)
             x = self.act(x)
@@ -71,7 +94,9 @@ class _LoRALinear(nn.Module):
         self.scale = scale
 
     def forward(self, x):
-        return self.base(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scale
+        lora_A = self.lora_A.to(device=x.device, dtype=x.dtype)
+        lora_B = self.lora_B.to(device=x.device, dtype=x.dtype)
+        return self.base(x) + (x @ lora_A.T @ lora_B.T) * self.scale
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -445,7 +470,7 @@ class AnimaIPAdapterApply:
                     x_dim = ip_weights["blocks.0.adaln_ip.1.weight"].shape[1]
                 except (KeyError, IndexError):
                     x_dim = inner_dim
-                dit.shared_ip_q_proj = nn.Linear(x_dim, inner_dim, bias=False).to(
+                dit.shared_ip_q_proj = _make_linear(x_dim, inner_dim, bias=False).to(
                     device=device, dtype=model_dtype)
             if has_shared_q:
                 mlp = dit.shared_ip_q_proj
@@ -463,7 +488,8 @@ class AnimaIPAdapterApply:
                     block.ip_v_proj = _make_shared_proj_ref(dit.shared_ip_v_proj)
                     block.adaln_ip = nn.Sequential(
                         nn.SiLU(),
-                        nn.Linear(inner_dim, inner_dim, bias=True, dtype=model_dtype, device=block_device),
+                        _make_linear(inner_dim, inner_dim, bias=True,
+                                     dtype=model_dtype, device=block_device),
                     )
                     nn.init.zeros_(block.adaln_ip[1].weight)
                     nn.init.constant_(block.adaln_ip[1].bias, 0.1)
@@ -496,17 +522,18 @@ class AnimaIPAdapterApply:
                     break
                 block_device = next(block.parameters()).device
                 if not hasattr(block, 'ip_k_proj'):
-                    block.ip_k_proj = nn.Linear(ip_embed_dim, inner_dim, bias=True,
-                                                dtype=model_dtype, device=block_device)
-                    block.ip_v_proj = nn.Linear(ip_embed_dim, inner_dim, bias=True,
-                                                dtype=model_dtype, device=block_device)
+                    block.ip_k_proj = _make_linear(ip_embed_dim, inner_dim, bias=True,
+                                                   dtype=model_dtype, device=block_device)
+                    block.ip_v_proj = _make_linear(ip_embed_dim, inner_dim, bias=True,
+                                                   dtype=model_dtype, device=block_device)
                     nn.init.normal_(block.ip_k_proj.weight, std=1.0 / math.sqrt(ip_embed_dim))
                     nn.init.zeros_(block.ip_k_proj.bias)
                     nn.init.normal_(block.ip_v_proj.weight, std=1.0 / math.sqrt(ip_embed_dim))
                     nn.init.zeros_(block.ip_v_proj.bias)
                     block.adaln_ip = nn.Sequential(
                         nn.SiLU(),
-                        nn.Linear(inner_dim, inner_dim, bias=True, dtype=model_dtype, device=block_device),
+                        _make_linear(inner_dim, inner_dim, bias=True,
+                                     dtype=model_dtype, device=block_device),
                     )
                     nn.init.zeros_(block.adaln_ip[1].weight)
                     nn.init.constant_(block.adaln_ip[1].bias, 0.1)
@@ -623,7 +650,7 @@ class AnimaIPAdapterApply:
                         return result
 
                     x_q = _blk_ref._x_cross_flat
-                    ip_tok = ip_tok.to(dtype=result.dtype)
+                    ip_tok = ip_tok.to(device=x_q.device, dtype=x_q.dtype)
                     B = x_B_T_H_W_D.shape[0]
                     T, H, W = x_B_T_H_W_D.shape[1], x_B_T_H_W_D.shape[2], x_B_T_H_W_D.shape[3]
                     n_h = _blk_ref.cross_attn.n_heads
@@ -720,7 +747,7 @@ class AnimaIPAdapterApply:
               f"norm={ip_tokens.norm().item():.4f}, strength={strength}")
 
         # Null tokens: gray-image encoding or checkpoint/zeros
-        ip_tokens_stored = ip_tokens.detach()
+        ip_tokens_stored = ip_tokens.detach().to(dtype=model_dtype)
         null_tokens_stored = ip_adapter.get("null_tokens", None)
         if gray_null:
             # Encode a gray image → natural "no signal" embedding in SigLIP2 space
@@ -773,11 +800,12 @@ class AnimaIPAdapterApply:
               ip_eff = ip_cfg_scale - 1.0
             """
 
-            def __init__(self, ip_tokens, null_tokens, ip_cfg_scale, ip_cfg_separate):
+            def __init__(self, ip_tokens, null_tokens, ip_cfg_scale, ip_cfg_separate, ip_dtype):
                 self.ip_tokens = ip_tokens
                 self.null_tokens = null_tokens
                 self.ip_cfg_scale = ip_cfg_scale
                 self.ip_cfg_separate = ip_cfg_separate
+                self.ip_dtype = ip_dtype
                 self._printed = False
                 self._cond_wo_ip = None      # prediction without IP (for post_cfg)
                 # When bound to text CFG, always enabled (old behavior).
@@ -796,16 +824,15 @@ class AnimaIPAdapterApply:
 
                 if not all_uncond:
                     ip_B = model_input.shape[0]
-                    target_dtype = model_input.dtype
                     target_device = model_input.device
 
-                    ip_tok = self.ip_tokens.to(dtype=target_dtype,
+                    ip_tok = self.ip_tokens.to(dtype=self.ip_dtype,
                                                 device=target_device)
                     ip_tok_batch = ip_tok.expand(ip_B, -1, -1).clone()
 
                     if self._enabled and cond_or_uncond is not None:
                         # cond → real, uncond → null (common to both modes)
-                        null_tok = self.null_tokens.to(dtype=target_dtype, device=target_device)
+                        null_tok = self.null_tokens.to(dtype=self.ip_dtype, device=target_device)
                         for idx, is_uncond in enumerate(cond_or_uncond):
                             if idx < ip_B and is_uncond:
                                 ip_tok_batch[idx] = null_tok
@@ -878,7 +905,7 @@ class AnimaIPAdapterApply:
             def to(self, *args, **kwargs):
                 return self
 
-        handler = IPAdapterHandler(ip_tokens_stored, null_tokens_stored, ip_cfg_scale, ip_cfg_separate)
+        handler = IPAdapterHandler(ip_tokens_stored, null_tokens_stored, ip_cfg_scale, ip_cfg_separate, model_dtype)
         patched_model.set_model_unet_function_wrapper(handler)
         patched_model.set_model_sampler_post_cfg_function(handler.post_cfg)
         return (patched_model,)
